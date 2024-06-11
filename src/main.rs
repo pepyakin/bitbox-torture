@@ -19,6 +19,10 @@ struct Cli {
     #[clap(short, long)]
     y: bool,
 
+    /// Whether to continue filling the database if it already exists.
+    #[clap(long, default_value = "false")]
+    cont: bool,
+
     /// Whether to not sync the database after each batch.
     #[clap(short, long, default_value = "false")]
     yolo: bool,
@@ -102,11 +106,15 @@ fn stat_database(cli: &Cli) -> anyhow::Result<()> {
 
 fn fill_database(cli: &Cli) -> anyhow::Result<()> {
     if std::path::Path::new(&cli.path).exists() {
-        if !cli.y {
-            eprintln!("Database already exists at {}", &cli.path);
-            return Ok(());
+        if !cli.cont {
+            if cli.y {
+                let _ = std::fs::remove_file(&cli.path);
+            } else {
+                anyhow::bail!("Database already exists, aborting.");
+            }
+        } else {
+            println!("Database already exists, continuing filling.");
         }
-        let _ = std::fs::remove_file(&cli.path);
     }
 
     let fill_ops = cli.subcmd.as_fill_opts().unwrap();
