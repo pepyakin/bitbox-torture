@@ -1,17 +1,40 @@
 use clap::Parser;
 use rand::{Rng, RngCore};
-use reth_libmdbx::{Environment, EnvironmentFlags, Geometry, Mode, PageSize, WriteFlags};
-use std::path::PathBuf;
+use reth_libmdbx::{
+    DatabaseFlags, Environment, EnvironmentFlags, Geometry, Mode, PageSize, WriteFlags, RW,
+};
+use std::{path::PathBuf, rc::Rc, str::FromStr};
 
 const GIGABYTE: usize = 1024 * 1024 * 1024;
 const TERABYTE: usize = GIGABYTE * 1024;
 
 const PATH: &str = "/mnt/mdbx-torture";
 
+#[derive(Debug, Copy, Clone)]
+enum EngineKind {
+    Mdbx,
+    Rocksdb,
+}
+
+impl FromStr for EngineKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "mdbx" => Ok(EngineKind::Mdbx),
+            "rocksdb" | "rdb" => Ok(EngineKind::Rocksdb),
+            _ => anyhow::bail!("Unknown engine kind: {}", s),
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 struct Cli {
     #[clap(subcommand)]
     subcmd: SubCommand,
+
+    #[clap(short, long)]
+    kind: EngineKind,
 
     #[clap(short, long, default_value = PATH)]
     path: String,
@@ -60,6 +83,119 @@ struct FillOpts {
     cold: f32,
 }
 
+enum Engine {
+    Mdbx(Environment),
+    Rocksdb(Rc<rocksdb::DB>),
+}
+
+impl Engine {
+    fn open(cli: &Cli) -> anyhow::Result<Engine> {
+        match cli.kind {
+            EngineKind::Mdbx => Engine::open_mdbx(cli),
+            EngineKind::Rocksdb => Engine::open_rocksdb(cli),
+        }
+    }
+
+    fn open_mdbx(cli: &Cli) -> anyhow::Result<Engine> {
+        let env = Environment::builder()
+            .set_max_dbs(256)
+            .write_map()
+            .set_flags(EnvironmentFlags {
+                mode: Mode::ReadWrite {
+                    sync_mode: if cli.yolo {
+                        reth_libmdbx::SyncMode::UtterlyNoSync
+                    } else {
+                        reth_libmdbx::SyncMode::Durable
+                    },
+                },
+                ..Default::default()
+            })
+            .set_geometry(Geometry {
+                // Maximum database size of 4 terabytes
+                size: Some(0..(4 * TERABYTE)),
+                // We grow the database in increments of 1 gigabytes
+                growth_step: Some(1 * GIGABYTE as isize),
+                // The database never shrinks
+                shrink_threshold: Some(0),
+                page_size: Some(PageSize::Set(4096)),
+            })
+            .open(&PathBuf::from(&cli.path))?;
+        Ok(Engine::Mdbx(env))
+    }
+
+    fn open_rocksdb(cli: &Cli) -> anyhow::Result<Engine> {
+        let db = rocksdb::DB::open_default(&cli.path)?;
+        Ok(Engine::Rocksdb(Rc::new(db)))
+    }
+
+    fn begin(&self) -> anyhow::Result<Tx> {
+        match self {
+            Engine::Mdbx(env) => {
+                let txn = env.begin_rw_txn()?;
+                let db = txn.create_db(None, DatabaseFlags::CREATE)?;
+                Ok(Tx::Mdbx { txn, db })
+            }
+            Engine::Rocksdb(db) => {
+                let batch = rocksdb::WriteBatch::default();
+                Ok(Tx::Rocksdb {
+                    db: db.clone(),
+                    batch,
+                })
+            }
+        }
+    }
+
+    fn print_stat(&self) -> anyhow::Result<String> {
+        match self {
+            Engine::Mdbx(env) => {
+                let txn = env.begin_ro_txn()?;
+                let main = txn.open_db(None).unwrap();
+                let stat = txn.db_stat(&main).unwrap();
+                Ok(format!("{:?}", stat))
+            }
+            _ => Ok("".to_string()),
+        }
+    }
+}
+
+enum Tx {
+    Mdbx {
+        txn: reth_libmdbx::Transaction<RW>,
+        db: reth_libmdbx::Database,
+    },
+    Rocksdb {
+        db: Rc<rocksdb::DB>,
+        batch: rocksdb::WriteBatch,
+    },
+}
+
+impl Tx {
+    fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> anyhow::Result<()> {
+        match self {
+            Tx::Mdbx { txn, db } => {
+                txn.put(db.dbi(), key, value, WriteFlags::empty())?;
+            }
+            Tx::Rocksdb { batch, .. } => {
+                batch.put(key, value);
+            }
+        }
+        Ok(())
+    }
+
+    fn commit(self) -> anyhow::Result<()> {
+        match self {
+            Tx::Mdbx { txn, .. } => {
+                txn.commit()?;
+                Ok(())
+            }
+            Tx::Rocksdb { db, batch } => {
+                db.write_without_wal(batch)?; // TODO: write wal = false?
+                Ok(())
+            }
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.subcmd {
@@ -68,42 +204,9 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn open(cli: &Cli) -> anyhow::Result<Environment> {
-    println!("Opening database, {:?}", cli);
-    let env = Environment::builder()
-        .set_max_dbs(256)
-        .write_map()
-        .set_flags(EnvironmentFlags {
-            mode: Mode::ReadWrite {
-                sync_mode: if cli.yolo {
-                    reth_libmdbx::SyncMode::UtterlyNoSync
-                } else {
-                    reth_libmdbx::SyncMode::Durable
-                },
-            },
-            ..Default::default()
-        })
-        .set_geometry(Geometry {
-            // Maximum database size of 4 terabytes
-            size: Some(0..(4 * TERABYTE)),
-            // We grow the database in increments of 1 gigabytes
-            growth_step: Some(1 * GIGABYTE as isize),
-            // The database never shrinks
-            shrink_threshold: Some(0),
-            page_size: Some(PageSize::Set(4096)),
-        })
-        .open(&PathBuf::from(&cli.path))?;
-    Ok(env)
-}
-
 fn stat_database(cli: &Cli) -> anyhow::Result<()> {
-    let env = open(cli)?;
-    let txn = env.begin_ro_txn().unwrap();
-    let main = txn.open_db(Some("main")).unwrap();
-    let stat = txn.db_stat(&main).unwrap();
-
-    println!("{:?}", stat);
-
+    let env = Engine::open(cli)?;
+    env.print_stat()?;
     Ok(())
 }
 
@@ -120,11 +223,9 @@ fn fill_database(cli: &Cli) -> anyhow::Result<()> {
     }
 
     let fill_ops = cli.subcmd.as_fill_opts().unwrap();
-    let env = open(cli)?;
 
-    let txn = env.begin_rw_txn().unwrap();
-    let main = txn.create_db(Some("main"), reth_libmdbx::DatabaseFlags::CREATE)?;
-    txn.commit()?;
+    println!("Opening database, {:?}", cli);
+    let env = Engine::open(cli)?;
 
     let mut rand = rand_pcg::Pcg64::new(0xcafef00dd15ea5e5, 0x60e11a7bf9cb254560e11a7bf9cb2545);
 
@@ -132,7 +233,7 @@ fn fill_database(cli: &Cli) -> anyhow::Result<()> {
 
     let mut remaining = fill_ops.n;
     loop {
-        let txn = env.begin_rw_txn().unwrap();
+        let mut txn = env.begin().unwrap();
 
         let start = std::time::Instant::now();
         for _ in 0..fill_ops.batch_sz {
@@ -151,13 +252,16 @@ fn fill_database(cli: &Cli) -> anyhow::Result<()> {
 
             let mut data = vec![0; fill_ops.value_sz];
             rand.fill_bytes(&mut data);
-            txn.put(main.dbi(), key, data, WriteFlags::empty()).unwrap();
+            txn.put(key, data).unwrap();
             remaining -= 1;
         }
 
         let batch_lat = start.elapsed();
-        let stat = txn.db_stat(&main).unwrap();
-        let (_, lat) = txn.commit()?;
+        // let stat = txn.db_stat(&main).unwrap();
+
+        let start = std::time::Instant::now();
+        txn.commit()?;
+        let commit_lat = start.elapsed();
 
         if remaining == 0 {
             break;
@@ -166,18 +270,14 @@ fn fill_database(cli: &Cli) -> anyhow::Result<()> {
         println!(
             "Commit {} items in {} ms",
             fill_ops.batch_sz,
-            lat.whole().as_millis()
+            commit_lat.as_millis()
         );
         println!(
             "Inserted {} items in {} ms",
             fill_ops.n - remaining,
             batch_lat.as_millis()
         );
-        println!("{:#?}", stat);
-    }
-
-    if cli.yolo {
-        env.sync(true)?;
+        // println!("{:#?}", stat);
     }
 
     Ok(())

@@ -11,6 +11,7 @@ clap = { version = "4.5.6", features = ["derive"] }
 rand = "0.8.5"
 rand_pcg = "0.3.1"
 reth-libmdbx = { git = "https://github.com/paradigmxyz/reth.git" }
+rocksdb = "0.22.0"
 
 [profile.release]
 debug = 1
