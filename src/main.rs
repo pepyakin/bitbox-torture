@@ -1,5 +1,5 @@
 use clap::Parser;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use reth_libmdbx::{Environment, EnvironmentFlags, Geometry, Mode, PageSize, WriteFlags};
 use std::path::PathBuf;
 
@@ -55,6 +55,9 @@ struct FillOpts {
 
     #[clap(short, long, default_value = "32")]
     value_sz: usize,
+
+    #[clap(short, long, default_value = "0.3")]
+    cold: f32,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -106,14 +109,13 @@ fn stat_database(cli: &Cli) -> anyhow::Result<()> {
 
 fn fill_database(cli: &Cli) -> anyhow::Result<()> {
     if std::path::Path::new(&cli.path).exists() {
-        if !cli.cont {
-            if cli.y {
-                let _ = std::fs::remove_file(&cli.path);
-            } else {
-                anyhow::bail!("Database already exists, aborting.");
-            }
-        } else {
+        if cli.y {
+            println!("Database already exists, removing.");
+            let _ = std::fs::remove_file(&cli.path);
+        } else if cli.cont {
             println!("Database already exists, continuing filling.");
+        } else {
+            anyhow::bail!("Database already exists, aborting.");
         }
     }
 
@@ -125,7 +127,8 @@ fn fill_database(cli: &Cli) -> anyhow::Result<()> {
     txn.commit()?;
 
     let mut rand = rand_pcg::Pcg64::new(0xcafef00dd15ea5e5, 0x60e11a7bf9cb254560e11a7bf9cb2545);
-    
+
+    let mut keys = Vec::with_capacity(fill_ops.n);
 
     let mut remaining = fill_ops.n;
     loop {
@@ -136,13 +139,22 @@ fn fill_database(cli: &Cli) -> anyhow::Result<()> {
             if remaining == 0 {
                 break;
             }
-            let mut key: [u8; 32] = [0; 32];
+
+            let key = if keys.is_empty() || rand.gen_bool(fill_ops.cold as f64) {
+                let mut key = vec![0; 32];
+                rand.fill_bytes(&mut key);
+                keys.push(key.clone());
+                key
+            } else {
+                keys[rand.gen_range(0..keys.len())].clone()
+            };
+
             let mut data = vec![0; fill_ops.value_sz];
-            rand.fill_bytes(&mut key);
             rand.fill_bytes(&mut data);
             txn.put(main.dbi(), key, data, WriteFlags::empty()).unwrap();
             remaining -= 1;
         }
+
         let batch_lat = start.elapsed();
         let stat = txn.db_stat(&main).unwrap();
         let (_, lat) = txn.commit()?;
